@@ -36,10 +36,11 @@ import torch.distributed as dist
 
 # Host configuration printing inside an eager timing window adds I/O latency.
 os.environ["DG_PRINT_CONFIGS"] = "0"
-import deep_gemm
 import gc_moe
 assert Path(gc_moe.__file__).resolve().is_relative_to(Path(_REPO_ROOT).resolve()), gc_moe.__file__
-from deep_gemm.utils import per_token_cast_to_fp4, per_token_cast_to_fp8
+from gc_moe.common.moe_quant import (
+    per_token_cast_to_fp4, per_token_cast_to_fp8, transform_sf_into_required_layout,
+)
 
 
 DEFAULT_TOKENS_PER_RANK: List[int] = [
@@ -394,7 +395,7 @@ def cast_grouped_weights_to_fp4(bf16_weights: torch.Tensor):
         w[i], w_sf[i] = per_token_cast_to_fp4(
             bf16_weights[i], use_ue8m0=True, gran_k=FP4_BLOCK,
         )
-    w_sf = deep_gemm.transform_sf_into_required_layout(
+    w_sf = transform_sf_into_required_layout(
         w_sf, N, K, (1, FP4_BLOCK), L,
     )
     return w, w_sf
@@ -434,6 +435,7 @@ def build_tokens(
 
 
 def main():
+    import deep_gemm
     parser = argparse.ArgumentParser()
     parser.add_argument("--hidden", type=int, default=6144)
     parser.add_argument("--intermediate-hidden", type=int, default=2048)

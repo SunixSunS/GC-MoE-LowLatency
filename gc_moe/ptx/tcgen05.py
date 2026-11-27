@@ -16,18 +16,18 @@ from cutlass._mlir import ir
 
 
 @dsl_user_op
-def mma_mxf8f6f4_2cta(desc_a: Uint64, desc_b: Uint64,
+def mma_mxf8f6f4(desc_a: Uint64, desc_b: Uint64,
                       accum_tmem: Uint32, accumulate: Uint32,
                       instr_desc_hi: Uint32, sfa_tmem: Uint32,
-                      sfb_tmem: Uint32, *, loc=None, ip=None) -> None:
-    """Issue reference 2CTA FP8×FP4 blockscaled MMA into FP32 TMEM."""
+                      sfb_tmem: Uint32, cta_group=2, *, loc=None, ip=None) -> None:
+    """Issue one FP8×FP4 blockscaled MMA into FP32 TMEM."""
     operands = [accum_tmem, desc_a, desc_b, instr_desc_hi,
                 accumulate, sfa_tmem, sfb_tmem]
     llvm.inline_asm(
         None, [x.ir_value(loc=loc, ip=ip) for x in operands],
         '{ .reg .pred p; '
         'setp.ne.b32 p, $4, 0; '
-        'tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale '
+        f'tcgen05.mma.cta_group::{cta_group}.kind::mxf8f6f4.block_scale '
         '[$0], $1, $2, $3, [$5], [$6], p; }',
         'r,l,l,r,r,r,r', has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT)
@@ -39,6 +39,7 @@ def mma_mxf8f6f4_k128_2cta(desc_a: Uint64, desc_b: Uint64,
                           instr0: Uint32, instr1: Uint32,
                           instr2: Uint32, instr3: Uint32,
                           sfa_tmem: Uint32, sfb_tmem: Uint32,
+                          b_step=None,
                           *, loc=None, ip=None) -> None:
     """Same four ordered K32 MMAs; reuse two local descriptor registers.
 
@@ -48,6 +49,12 @@ def mma_mxf8f6f4_k128_2cta(desc_a: Uint64, desc_b: Uint64,
     """
     operands = [accum_tmem, desc_a, desc_b, instr0, instr1,
                 instr2, instr3, first_accumulate, sfa_tmem, sfb_tmem]
+    constraints = 'r,l,l,r,r,r,r,r,r,r'
+    step = '2'
+    if b_step is not None:
+        operands.append(b_step)
+        constraints += ',l'
+        step = '$10'
     llvm.inline_asm(
         None, [x.ir_value(loc=loc, ip=ip) for x in operands],
         '{ .reg .pred p; .reg .b64 mma_desc_a, mma_desc_b; '
@@ -56,30 +63,30 @@ def mma_mxf8f6f4_k128_2cta(desc_a: Uint64, desc_b: Uint64,
         'tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale '
         '[$0], mma_desc_a, mma_desc_b, $3, [$8], [$9], p; '
         'add.u64 mma_desc_a, mma_desc_a, 2; '
-        'add.u64 mma_desc_b, mma_desc_b, 2; '
+        f'add.u64 mma_desc_b, mma_desc_b, {step}; '
         'setp.ne.b32 p, 1, 0; '
         'tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale '
         '[$0], mma_desc_a, mma_desc_b, $4, [$8], [$9], p; '
         'add.u64 mma_desc_a, mma_desc_a, 2; '
-        'add.u64 mma_desc_b, mma_desc_b, 2; '
+        f'add.u64 mma_desc_b, mma_desc_b, {step}; '
         'tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale '
         '[$0], mma_desc_a, mma_desc_b, $5, [$8], [$9], p; '
         'add.u64 mma_desc_a, mma_desc_a, 2; '
-        'add.u64 mma_desc_b, mma_desc_b, 2; '
+        f'add.u64 mma_desc_b, mma_desc_b, {step}; '
         'tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale '
         '[$0], mma_desc_a, mma_desc_b, $6, [$8], [$9], p; }',
-        'r,l,l,r,r,r,r,r,r,r', has_side_effects=True,
+        constraints, has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT)
 
 
 @dsl_user_op
-def utccp_sf_4x32_2cta(smem_desc: Uint64, tmem_col: Uint32,
-                       *, loc=None, ip=None) -> None:
+def utccp_sf_4x32(smem_desc: Uint64, tmem_col: Uint32,
+                 cta_group=2, *, loc=None, ip=None) -> None:
     """Copy 128 packed-int32 UE8M0 elements (512 bytes) to TMEM."""
     llvm.inline_asm(
         None, [tmem_col.ir_value(loc=loc, ip=ip),
                smem_desc.ir_value(loc=loc, ip=ip)],
-        'tcgen05.cp.cta_group::2.32x128b.warpx4 [$0], $1;',
+        f'tcgen05.cp.cta_group::{cta_group}.32x128b.warpx4 [$0], $1;',
         'r,l', has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT)
 
@@ -95,6 +102,14 @@ def tcgen05_commit_2cta(mbar_ptr: cute.Pointer, cta_mask: Uint16,
         'multicast::cluster.b64 [$0], $1;',
         'r,h', has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def tcgen05_commit_local(mbar_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None, [mbar_ptr.toint(loc=loc, ip=ip).ir_value()],
+        'tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [$0];',
+        'r', has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -125,10 +140,10 @@ def tmem_load_16dp256b4(address: Uint32, *, loc=None, ip=None) -> tuple[Float32,
 
 
 @dsl_user_op
-def tmem_free_2cta(address: Uint32, columns: Uint32, *, loc=None, ip=None) -> None:
+def tmem_free(address: Uint32, columns: Uint32, cta_group=2, *, loc=None, ip=None) -> None:
     llvm.inline_asm(None, [address.ir_value(loc=loc, ip=ip),
                            columns.ir_value(loc=loc, ip=ip)],
-                    'tcgen05.dealloc.cta_group::2.sync.aligned.b32 $0, $1;',
+                    f'tcgen05.dealloc.cta_group::{cta_group}.sync.aligned.b32 $0, $1;',
                     'r,r', has_side_effects=True,
                     asm_dialect=llvm.AsmDialect.AD_ATT)
 

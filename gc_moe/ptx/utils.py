@@ -22,10 +22,25 @@ def read_clock64(*, loc=None, ip=None) -> Uint64:
 
 
 @dsl_user_op
+def sleep_ns(duration: Uint32, *, loc=None, ip=None) -> None:
+    """Pause an unsuccessful device poll for approximately this duration."""
+    llvm.inline_asm(None, [duration.ir_value(loc=loc, ip=ip)], 'nanosleep.u32 $0;',
+                    'r', has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT,
+                    loc=loc, ip=ip)
+
+
+@dsl_user_op
 def device_trap(*, loc=None, ip=None) -> None:
     """A timed-out barrier must fail the kernel, never resume as success."""
     llvm.inline_asm(None, [], 'trap;', '', has_side_effects=True,
                     asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def launch_dependents(*, loc=None, ip=None) -> None:
+    llvm.inline_asm(None, [], 'griddepcontrol.launch_dependents;', '',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT,
+                    loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -69,6 +84,15 @@ def accumulate_bf16_into_f32(acc: Float32, bf16_bits: Uint16,
         'add.rn.f32.bf16 $0, $1, $2;', '=f,h,f',
         has_side_effects=False, asm_dialect=llvm.AsmDialect.AD_ATT)
     return Float32(value)
+
+
+@dsl_user_op
+def match_lanes_u32(key: Uint32, *, loc=None, ip=None) -> Uint32:
+    value = llvm.inline_asm(
+        T.i32(), [key.ir_value(loc=loc, ip=ip)],
+        'match.any.sync.b32 $0, $1, 0xffffffff;', '=r,r',
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return Uint32(value)
 
 
 @dsl_user_op

@@ -118,24 +118,77 @@ def repack_fp8_weights(tensor: torch.Tensor, block_k: int = 128) -> torch.Tensor
                  .permute(1, 0, 2).contiguous())
 
 
+def is_routed_weight_tile_layout(tensor: torch.Tensor) -> bool:
+    if tensor.ndim != 4 or tensor.dtype != torch.int8:
+        return False
+    _, tiles, rows, row_bytes = tensor.shape
+    expert_stride, tile_stride, row_stride, element_stride = tensor.stride()
+    return (element_stride == 1 and row_stride == row_bytes and
+            ((tile_stride >= rows * row_bytes and expert_stride >= tiles * tile_stride) or
+             is_routed_weight_k_major(tensor)))
+
+
+def is_routed_weight_k_major(tensor: torch.Tensor) -> bool:
+    """Recognize K planes that physically contain all local experts."""
+    if tensor.ndim != 4 or tensor.dtype != torch.int8:
+        return False
+    experts, _, rows, row_bytes = tensor.shape
+    return experts > 1 and tensor.stride() == (rows * row_bytes, experts * rows * row_bytes,
+                                               row_bytes, 1)
+
+
+def colocate_routed_scales(payload: torch.Tensor, scales: torch.Tensor):
+    """Place each routed K128 plane beside its original packed row scales."""
+    if not is_routed_weight_tile_layout(payload):
+        raise ValueError('expected K128 routed weight tiles')
+    experts, tiles, rows, row_bytes = payload.shape
+    if (scales.dtype != torch.int32 or tuple(scales.shape) != (experts, rows, tiles) or
+            scales.device != payload.device or rows % 128):
+        raise ValueError('expected matching packed routed scales and 128-aligned N')
+    weight_bytes = rows * row_bytes
+    plane_bytes = weight_bytes + rows * 4
+    storage = torch.empty(experts * tiles * plane_bytes, dtype=torch.int8, device=payload.device)
+    weight_view = storage.as_strided(payload.shape, (tiles * plane_bytes, plane_bytes, row_bytes, 1))
+    scale_view = storage.view(torch.int32).as_strided(
+        scales.shape, (tiles * plane_bytes // 4, 1, plane_bytes // 4), weight_bytes // 4)
+    weight_view.copy_(payload)
+    scale_view.copy_(scales)
+    return weight_view, scale_view
+
+
 def make_tma_weights_3d_desc(tensor: torch.Tensor, block_k: int, load_n: int,
-                     swizzle: int = 128) -> TmaDescriptorSpec:
+                     swizzle: int = 128, *, pair_k: bool = False) -> TmaDescriptorSpec:
     """Map a tile-repacked FP4 weight tensor to a 4D (K-tile,rows,kb,expert) map.
 
     The tensor is (experts, kb, rows, block_k/2) int8 from repack_fp4_weights.
     One box (block_k, load_n, 1, 1) then reads a single contiguous global
     range: row stride is block_k/2 bytes and rows are adjacent.
     """
+    if tensor.ndim == 6 and tensor.dtype == torch.int8:
+        experts, groups, n_tiles, inner_k, rows, segment = tensor.shape
+        if (not tensor.is_contiguous() or inner_k not in (2, 4, 8, 16) or
+                (rows, segment * 2) != (load_n, block_k)):
+            raise ValueError('grouped routed weights must have contiguous N128 K groups')
+        return _base(tensor, (block_k, rows, inner_k, experts * groups * n_tiles),
+                     (tensor.stride(4), tensor.stride(3), tensor.stride(2)),
+                     (block_k, load_n, 2 if pair_k else 1, 1), swizzle)
     if tensor.ndim != 4 or tensor.dtype != torch.int8:
         raise ValueError('routed FP4 weights must be tile-repacked int8 4D')
-    if not tensor.is_contiguous():
-        raise ValueError('routed FP4 repacked storage must be contiguous')
+    if not is_routed_weight_tile_layout(tensor):
+        raise ValueError('routed FP4 repacked storage must have contiguous rows within each K tile')
     experts, kb, rows, segment = tensor.shape
     if segment * 2 != block_k or rows % load_n or kb <= 0:
         raise ValueError('FP4 weight tiles must match the descriptor K block')
+    k_box = 2 if pair_k else 1
+    if kb % k_box:
+        raise ValueError('paired FP4 TMA needs an even number of K128 planes')
+    if is_routed_weight_k_major(tensor):
+        return _base(tensor, (block_k, rows, experts, kb),
+                     (tensor.stride(2), tensor.stride(0), tensor.stride(1)),
+                     (block_k, load_n, 1, k_box), swizzle)
     return _base(tensor, (block_k, rows, kb, experts),
                  (tensor.stride(2), tensor.stride(1), tensor.stride(0)),
-                 (block_k, load_n, 1, 1), swizzle)
+                 (block_k, load_n, k_box, 1), swizzle)
 
 
 def make_tma_weights_2d_desc(tensor: torch.Tensor, block_k: int, load_n: int,

@@ -97,7 +97,7 @@ from ..ptx.tcgen05 import (
     tcgen05_commit_2cta,
     tcgen05_after_thread_sync,
     tcgen05_before_thread_sync,
-    tmem_free_2cta,
+    tmem_free,
     tmem_load_16dp256b4,
 )
 from ..ptx.tma import (
@@ -568,7 +568,7 @@ class GCK3FrontKernel:
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
         if warp == 2:
-            tmem_free_2cta(tmem[0], Uint32(2 * rows))
+            tmem_free(tmem[0], Uint32(2 * rows))
 
     @cute.jit
     def __call__(self, workspace: cute.Tensor, weight_map: cute.Tensor, input_map: cute.Tensor):
@@ -1544,7 +1544,7 @@ class GCK3MoERoleKernel:
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
         if warp == Uint32(3) and pair < jobs:
-            tmem_free_2cta(tmem_ptr[0], Uint32(2 * self.projection_tile_rows))
+            tmem_free(tmem_ptr[0], Uint32(2 * self.projection_tile_rows))
 
     @cute.kernel
     def kernel(self, signals: cute.Tensor, peer_ptrs: cute.Tensor,
@@ -2904,7 +2904,7 @@ class GCK3MoERoleKernel:
                     iteration = Uint32(iteration + Uint32(1))
                 # The same full epilogue warp in both CTAs retires TMEM.
                 if physical_warp == 4:
-                    tmem_free_2cta(tptr[0], Uint32(self.tmem_cols))
+                    tmem_free(tptr[0], Uint32(self.tmem_cols))
             if cutlass.const_expr(self.early_shared):
                 # All threads complete the Front dependency before returning.
                 cute.arch.griddepcontrol_wait()

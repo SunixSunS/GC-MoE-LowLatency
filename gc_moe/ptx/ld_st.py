@@ -18,6 +18,24 @@ EVICT_LAST = 0x14F0000000000000
 
 
 @dsl_user_op
+def cp_async_raw16(dst: cute.Pointer, src: Uint64, payload: Uint32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None, [dst.toint(loc=loc, ip=ip).ir_value(), src.ir_value(loc=loc, ip=ip),
+               payload.ir_value(loc=loc, ip=ip)],
+        'cp.async.cg.shared.global [$0], [$1], 16, $2;',
+        'r,l,r,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def cp_async_raw_wait(*, loc=None, ip=None) -> None:
+    llvm.inline_asm(
+        None, [], 'cp.async.commit_group; cp.async.wait_group 0;',
+        '~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def ld_volatile_u32(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint32:
     address = ptr.toint(loc=loc, ip=ip).ir_value()
     value = llvm.inline_asm(T.i32(), [address],
@@ -68,6 +86,15 @@ def ld_acquire_gpu_u32(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def ld_acquire_sys_u32(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint32:
+    value = llvm.inline_asm(
+        T.i32(), [ptr.toint(loc=loc, ip=ip).ir_value()],
+        'ld.acquire.sys.global.u32 $0, [$1];', '=r,l,~{memory}',
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return Uint32(value)
+
+
+@dsl_user_op
 def ld_acquire_gpu_u64(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint64:
     address = ptr.toint(loc=loc, ip=ip).ir_value()
     value = llvm.inline_asm(T.i64(), [address],
@@ -94,10 +121,41 @@ def ld_acquire_sys_u64(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint64:
 
 
 @dsl_user_op
+def multimem_load_add_u64(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint64:
+    value = llvm.inline_asm(
+        T.i64(), [ptr.toint(loc=loc, ip=ip).ir_value()],
+        'multimem.ld_reduce.acquire.sys.global.add.u64 $0, [$1];', '=l,l,~{memory}',
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return Uint64(value)
+
+
+@dsl_user_op
+def multimem_store_release_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+                    'multimem.st.release.sys.global.u64 [$0], $1;', 'l,l,~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def multimem_store_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+                    'multimem.st.relaxed.sys.global.u64 [$0], $1;', 'l,l,~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def red_release_gpu_add_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> None:
     llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
                     'red.release.gpu.global.add.u32 [$0], $1;', 'l,r',
                     has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def atom_acq_rel_sys_or_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+                    '{ .reg .b32 old; atom.acq_rel.sys.global.or.b32 old, [$0], $1; }',
+                    'l,r,~{memory}', has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT,
+                    loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -112,6 +170,13 @@ def red_gpu_add_s32(ptr: cute.Pointer, value: Int32, *, loc=None, ip=None) -> No
     llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
                     'red.gpu.global.add.s32 [$0], $1;', 'l,r',
                     has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def red_sys_add_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+                    'red.relaxed.sys.global.add.u64 [$0], $1;', 'l,l,~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -149,6 +214,24 @@ def atom_sys_add_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> 
 
 
 @dsl_user_op
+def atom_acq_rel_gpu_add_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> Uint64:
+    previous = llvm.inline_asm(
+        T.i64(), [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+        'atom.acq_rel.gpu.global.add.u64 $0, [$1], $2;', '=l,l,l,~{memory}',
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return Uint64(previous)
+
+
+@dsl_user_op
+def atom_acq_rel_sys_add_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> Uint32:
+    previous = llvm.inline_asm(
+        T.i32(), [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+        'atom.acq_rel.sys.global.add.u32 $0, [$1], $2;', '=r,l,r,~{memory}',
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return Uint32(previous)
+
+
+@dsl_user_op
 def atom_release_gpu_add_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> Uint32:
     previous = llvm.inline_asm(
         T.i32(), [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
@@ -167,10 +250,34 @@ def atom_shared_add_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) 
 
 
 @dsl_user_op
+def append_shared_route_index(ptr: cute.Pointer, index: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Reserve one route and inline the first two byte indices."""
+    slot = llvm.inline_asm(
+        T.i32(), [ptr.toint(loc=loc, ip=ip).ir_value(), index.ir_value(loc=loc, ip=ip)],
+        '{ .reg .pred head; .reg .b32 value, shift, slot; '
+        'atom.shared.add.u32 value, [$1], 65536; '
+        'shr.u32 slot, value, 16; '
+        'setp.lt.u32 head, slot, 2; '
+        '@head shl.b32 shift, slot, 3; '
+        '@head shl.b32 value, $2, shift; '
+        '@head red.shared::cta.or.b32 [$1], value; '
+        'mov.b32 $0, slot; }',
+        '=r,r,r', has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return Uint32(slot)
+
+
+@dsl_user_op
 def st_release_sys_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> None:
     llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
                     'st.release.sys.global.u64 [$0], $1;', 'l,l,~{memory}',
                     has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def st_release_gpu_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+                    'st.release.gpu.global.u32 [$0], $1;', 'l,r,~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -214,12 +321,14 @@ def st_global_u32x4(dst_gmem: cute.Pointer, value_0: Uint32,
 
 
 @dsl_user_op
-def ld_global_u32x4(src: cute.Pointer, *, loc=None, ip=None) -> tuple[Uint32, Uint32, Uint32, Uint32]:
+def ld_global_u32x4(src: cute.Pointer, *, volatile: bool = False, relaxed_sys: bool = False,
+                    loc=None, ip=None) -> tuple[Uint32, Uint32, Uint32, Uint32]:
     """Read one aligned 16-byte source scale-factor vector."""
+    qualifier = '.relaxed.sys' if relaxed_sys else '.volatile' if volatile else ''
     words = llvm.inline_asm(
         ir.Type.parse('!llvm.struct<(i32,i32,i32,i32)>'),
         [src.toint(loc=loc, ip=ip).ir_value()],
-        'ld.global.v4.b32 {$0, $1, $2, $3}, [$4];',
+        'ld' + qualifier + '.global.v4.b32 {$0, $1, $2, $3}, [$4];',
         '=r,=r,=r,=r,l', has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT)
     return tuple(Uint32(llvm.extractvalue(T.i32(), words, [i])) for i in range(4))
@@ -292,6 +401,29 @@ def stmatrix_bf16x8_trans(dst_smem: cute.Pointer,
         '[$0], {$1, $2, $3, $4};',
         'r,r,r,r,r', has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def transpose_bf16x2(fragment: Uint32, *, loc=None, ip=None) -> Uint32:
+    value = llvm.inline_asm(
+        T.i32(), [fragment.ir_value(loc=loc, ip=ip)],
+        'movmatrix.sync.aligned.m8n8.trans.b16 $0, $1;', '=r,r',
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+    return Uint32(value)
+
+
+@dsl_user_op
+def select_fp8_token_bytes(first: Uint32, second: Uint32, odd: Uint32,
+                           *, loc=None, ip=None) -> Uint32:
+    """Take one token from four adjacent channel pairs."""
+    value = llvm.inline_asm(
+        T.i32(), [first.ir_value(loc=loc, ip=ip), second.ir_value(loc=loc, ip=ip),
+                  odd.ir_value(loc=loc, ip=ip)],
+        '{ .reg .pred p; .reg .b32 selection; setp.ne.u32 p, $3, 0; '
+        'selp.b32 selection, 0x7531, 0x6420, p; prmt.b32 $0, $1, $2, selection; }',
+        '=r,r,r,r', has_side_effects=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip)
+    return Uint32(value)
 
 
 @dsl_user_op

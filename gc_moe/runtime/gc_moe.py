@@ -146,6 +146,13 @@ class RoleBinary:
     smem_bytes: int
     threads: int
     grid: int
+    programmatic_input: bool = False
+    wait_on_dispatch: bool = False
+    cooperative: bool = False
+    independent_compute_ctas: bool = False
+    programmatic_dispatch_input: bool = False
+    programmatic_at_block_start: bool = False
+    nvlink_centric_scheduling: bool = False
 
 
 class _KernelArgs:
@@ -163,8 +170,10 @@ class _KernelArgs:
         return b"".join(ctypes.string_at(ctypes.addressof(x), ctypes.sizeof(x)) for x in self.values)
 
 
-def _child_key(binaries: Sequence[RoleBinary], arguments: Sequence[_KernelArgs]) -> bytes:
+def _child_key(binaries: Sequence[RoleBinary], arguments: Sequence[_KernelArgs],
+               cluster_policy: int = 0) -> bytes:
     key = hashlib.sha256()
+    key.update(bytes((cluster_policy,)))
     for binary, role_args in zip(binaries, arguments):
         key.update(len(role_args.signature).to_bytes(4, 'little'))
         key.update(role_args.signature)
@@ -173,6 +182,9 @@ def _child_key(binaries: Sequence[RoleBinary], arguments: Sequence[_KernelArgs])
         key.update(binary.smem_bytes.to_bytes(8, 'little'))
         key.update(binary.threads.to_bytes(4, 'little'))
         key.update(binary.grid.to_bytes(4, 'little'))
+        key.update(bytes((binary.programmatic_input, binary.wait_on_dispatch, binary.cooperative)))
+        key.update(bytes((binary.independent_compute_ctas, binary.programmatic_dispatch_input,
+                          binary.programmatic_at_block_start, binary.nvlink_centric_scheduling)))
     return key.digest()
 
 
@@ -204,46 +216,31 @@ def _runtime_locked(function):
 
 class _ChildGraph:
     def __init__(self, owner: 'GreenContextPair', binaries: Sequence[RoleBinary],
-                 arguments: Sequence[_KernelArgs]):
-        if len(binaries) != 3 or [x.role for x in binaries] != [1, 2, 3]:
+                 arguments: Sequence[_KernelArgs], cluster_policy: int = 0):
+        roles = tuple(binary.role for binary in binaries)
+        if roles not in ((1, 2, 3), (1, 2, 2, 3), (2, 3), (1, 2)):
             raise ValueError('expected dispatch, compute, finalize cubins')
-        if len(arguments) != 3:
+        if roles == (2, 3) and not owner.primary_ctx_roles:
+            raise ValueError('fused dispatch/compute must run in the primary context')
+        if roles == (1, 2) and (not owner.primary_ctx_roles or not binaries[-1].cooperative):
+            raise ValueError('fused compute/finalize needs a cooperative primary-context grid')
+        if len(arguments) != len(binaries):
             raise ValueError('expected one argument vector per role')
         self.graph = None
         self.executable = None
         self.kernels = []
         self.arguments = tuple(arguments)
+        self.binaries = tuple(binaries)
+        self.cluster_policy = cluster_policy
         try:
             self.graph = _ok(cu.cuGraphCreate(0))
-            nodes = []
-            for index, binary in enumerate(binaries):
+            for binary in self.binaries:
                 loaded = owner._get_loaded_kernel(binary)
                 self.kernels.append(loaded)
-                kernel = loaded.kernel
                 _ok(cu.cuKernelSetAttribute(
                     cu.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    binary.smem_bytes, kernel, owner.device))
-                params = cu.CUgraphNodeParams()
-                params.type = cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
-                params.kernel.kern = kernel
-                params.kernel.ctx = (owner.primary_context
-                                     if owner.primary_ctx_roles else
-                                     owner.contexts[0 if index == 0 else 1])
-                params.kernel.gridDimX = binary.grid
-                params.kernel.gridDimY = params.kernel.gridDimZ = 1
-                params.kernel.blockDimX = binary.threads
-                params.kernel.blockDimY = params.kernel.blockDimZ = 1
-                params.kernel.sharedMemBytes = binary.smem_bytes
-                params.kernel.kernelParams = arguments[index].pointer
-                dependencies = nodes[:2] if index == 2 else []
-                node = _ok(cu.cuGraphAddNode(self.graph, dependencies, None,
-                                             len(dependencies), params))
-                if index == 1:
-                    attr = cu.CUkernelNodeAttrValue()
-                    attr.clusterDim.x, attr.clusterDim.y, attr.clusterDim.z = 2, 1, 1
-                    _ok(cu.cuGraphKernelNodeSetAttribute(
-                        node, cu.CUkernelNodeAttrID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION, attr))
-                nodes.append(node)
+                    binary.smem_bytes, loaded.kernel, owner.device))
+            self.add_nodes(owner, self.graph)
             self.instantiate()
         except Exception:
             try:
@@ -254,6 +251,63 @@ class _ChildGraph:
                 _pin_failed_pair(owner)
                 raise
             raise
+
+    def add_nodes(self, owner, graph, roots=(), root_edges=None, root_count=0):
+        nodes = []
+        for index, (binary, loaded, argument) in enumerate(
+                zip(self.binaries, self.kernels, self.arguments)):
+            params = cu.CUgraphNodeParams()
+            params.type = cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
+            params.kernel.kern = loaded.kernel
+            params.kernel.ctx = (owner.primary_context if owner.primary_ctx_roles else
+                                 owner.contexts[0 if index == 0 else 1])
+            params.kernel.gridDimX = binary.grid
+            params.kernel.gridDimY = params.kernel.gridDimZ = 1
+            params.kernel.blockDimX = binary.threads
+            params.kernel.blockDimY = params.kernel.blockDimZ = 1
+            params.kernel.sharedMemBytes = binary.smem_bytes
+            params.kernel.kernelParams = argument.pointer
+            dependencies = nodes.copy() if binary.role == 3 else (
+                nodes[:1] if binary.wait_on_dispatch or binary.programmatic_dispatch_input else [])
+            edge_data = None
+            count = len(dependencies)
+            if not count and root_count:
+                dependencies, edge_data, count = roots, root_edges, root_count
+            elif count and (binary.programmatic_input or binary.programmatic_dispatch_input):
+                edge_data = [cu.CUgraphEdgeData() for _ in dependencies]
+                for producer, edge in zip(self.binaries, edge_data):
+                    if binary.programmatic_dispatch_input or producer.role == 2:
+                        edge.type = cu.CUgraphDependencyType.CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC
+                        if binary.programmatic_at_block_start:
+                            port = getattr(cu, 'CU_GRAPH_KERNEL_NODE_PORT_LAUNCH_COMPLETION', None)
+                            if port is None:
+                                port = cu.CU_GRAPH_KERNEL_NODE_PORT_LAUNCH_ORDER
+                            edge.from_port = port
+                        else:
+                            edge.from_port = cu.CU_GRAPH_KERNEL_NODE_PORT_PROGRAMMATIC
+            node = _ok(cu.cuGraphAddNode(graph, dependencies, edge_data, count, params))
+            if binary.nvlink_centric_scheduling:
+                attr = cu.CUkernelNodeAttrValue()
+                attr.nvlinkUtilCentricScheduling = 1
+                _ok(cu.cuGraphKernelNodeSetAttribute(
+                    node, cu.CUkernelNodeAttrID.CU_LAUNCH_ATTRIBUTE_NVLINK_UTIL_CENTRIC_SCHEDULING, attr))
+            if binary.role == 2 and not binary.independent_compute_ctas:
+                attr = cu.CUkernelNodeAttrValue()
+                attr.clusterDim.x, attr.clusterDim.y, attr.clusterDim.z = 2, 1, 1
+                _ok(cu.cuGraphKernelNodeSetAttribute(
+                    node, cu.CUkernelNodeAttrID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION, attr))
+                if self.cluster_policy:
+                    attr = cu.CUkernelNodeAttrValue()
+                    attr.clusterSchedulingPolicyPreference = cu.CUclusterSchedulingPolicy(self.cluster_policy)
+                    _ok(cu.cuGraphKernelNodeSetAttribute(
+                        node, cu.CUkernelNodeAttrID.CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE, attr))
+            if binary.cooperative:
+                attr = cu.CUkernelNodeAttrValue()
+                attr.cooperative = 1
+                _ok(cu.cuGraphKernelNodeSetAttribute(
+                    node, cu.CUkernelNodeAttrID.CU_LAUNCH_ATTRIBUTE_COOPERATIVE, attr))
+            nodes.append(node)
+        return nodes
 
     def instantiate(self):
         if self.executable is None:
@@ -368,7 +422,8 @@ class GreenContextPair:
 
     @_runtime_locked
     def launch(self, binaries: Sequence[RoleBinary], arguments: Sequence,
-               stream: int | None = None) -> None:
+               stream: int | None = None, *, flatten_capture: bool = False,
+               cluster_policy: int = 0) -> None:
         if _RUNTIME_STATE != 'open':
             raise RuntimeError(f"kernel runtime is {_RUNTIME_STATE}")
         if self._state != 'open':
@@ -384,16 +439,16 @@ class GreenContextPair:
         # A role may have its own CuTe kernel ABI (for example a peer pointer
         # table used by dispatch/epilogue but not the MMA worker). Retain the
         # previous flat-vector form for existing single-rank callers.
-        if len(arguments) == 3 and all(isinstance(item, (tuple, list))
+        if len(arguments) == len(binaries) and all(isinstance(item, (tuple, list))
                                        for item in arguments):
             args = tuple(_KernelArgs(item) for item in arguments)
         else:
             common = _KernelArgs(arguments)
             args = (common, common, common)
-        key = _child_key(binaries, args)
+        key = _child_key(binaries, args, cluster_policy)
         graph = self.graphs.get(key)
         if graph is None:
-            graph = _ChildGraph(self, binaries, args)
+            graph = _ChildGraph(self, binaries, args, cluster_policy)
             try:
                 self.graphs[key] = graph
             except Exception:
@@ -406,12 +461,19 @@ class GreenContextPair:
                     raise
                 raise
         if capture_status == cu.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE:
-            params = cu.CUgraphNodeParams()
-            params.type = cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_GRAPH
-            params.graph.graph = graph.graph
-            child = _ok(cu.cuGraphAddNode(parent, dependencies, edges, count, params))
+            if flatten_capture:
+                if not self.primary_ctx_roles:
+                    raise ValueError('flat Decode capture requires primary-context roles')
+                # Programmatic edges can release a successor before its producer exits.
+                # Preserve child-graph completion semantics for the caller's next node.
+                completed = graph.add_nodes(self, parent, dependencies, edges, count)
+            else:
+                params = cu.CUgraphNodeParams()
+                params.type = cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_GRAPH
+                params.graph.graph = graph.graph
+                completed = [_ok(cu.cuGraphAddNode(parent, dependencies, edges, count, params))]
             _ok(cu.cuStreamUpdateCaptureDependencies(
-                stream, [child], None, 1,
+                stream, completed, None, len(completed),
                 cu.CUstreamUpdateCaptureDependencies_flags.CU_STREAM_SET_CAPTURE_DEPENDENCIES))
         elif capture_status == cu.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_NONE:
             graph.instantiate()
@@ -538,7 +600,8 @@ def get_context(*, num_ranks: int) -> GreenContextPair:
     contexts = holder.contexts
     # Calls in different process groups may need different SM budgets even
     # on the same CUDA context. Reuse only the same effective SM request.
-    key = (int(current), requested_dispatch_sms)
+    primary_roles = _get_env_int('GC_MOE_PRIMARY_CTX', 0) != 0
+    key = (int(current), requested_dispatch_sms, primary_roles)
     if key not in contexts or contexts[key]._state == 'closed':
         contexts[key] = GreenContextPair(
             requested_dispatch_sms=requested_dispatch_sms, num_ranks=num_ranks)

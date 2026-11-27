@@ -154,6 +154,31 @@ def ue8m0_fp8_scale_exp(amax: Float32) -> Uint32:
     return rounded_exp - Uint32(8)
 
 
+@dsl_user_op
+def round_ue8m0_pair(first: Float32, second: Float32, *, loc=None, ip=None) -> Uint32:
+    result = llvm.inline_asm(
+        T.i32(), [first.ir_value(loc=loc, ip=ip), second.ir_value(loc=loc, ip=ip)],
+        '{ .reg .b16 pair; cvt.rp.satfinite.ue8m0x2.f32 pair, $2, $1; '
+        'cvt.u32.u16 $0, pair; }',
+        '=r,f,f', has_side_effects=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip)
+    return Uint32(result)
+
+
+@cute.jit
+def ue8m0_fp8_scale_exp_pair(amax0: Float32, amax1: Float32) -> tuple[Uint32, Uint32]:
+    """Paired encoding with the scalar E4M3 scale's exact rounding boundary."""
+    # At each power-of-two boundary, multiplying by the RN float32
+    # reciprocal maps 1.75 and its predecessor to <= 1, and its
+    # successor to > 1. Apply the original exponent floor and Inf cap.
+    reciprocal = Float32(1.0 / 448.0)
+    scaled0, scaled1 = cute.arch.mul_packed_f32x2(
+        (amax0, amax1), (reciprocal, reciprocal), rnd='rn', ftz=False)
+    packed = round_ue8m0_pair(scaled0, scaled1)
+    return (max(Uint32(105), min(Uint32(247), packed & Uint32(0xff))),
+            max(Uint32(105), min(Uint32(247), packed >> Uint32(8))))
+
+
 @cute.jit
 def ue8m0_fp8_inv(sf_exp: Uint32) -> Float32:
     return bits_float((Uint32(254) - sf_exp) << 23)
@@ -187,6 +212,18 @@ def warp_group4_max(value: Float32) -> Float32:
         value = fmax_f32(value, cute.arch.shuffle_sync_bfly(
             value, 4 << offset))
     return value
+
+
+@dsl_user_op
+def warp_group4_hardware_max(value: Float32, lane: Uint32, *, loc=None, ip=None) -> Float32:
+    """Reduce across the eight SM100 lanes with the same lane modulo four."""
+    result = llvm.inline_asm(
+        T.f32(), [value.ir_value(loc=loc, ip=ip), lane.ir_value(loc=loc, ip=ip)],
+        '{ .reg .b32 group, mask; and.b32 group, $2, 3; '
+        'shl.b32 mask, 0x11111111, group; redux.sync.max.f32 $0, $1, mask; }',
+        '=f,f,r', has_side_effects=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip)
+    return Float32(result)
 
 
 @cute.jit

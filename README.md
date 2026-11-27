@@ -133,6 +133,8 @@ GLM5.2 and DSV4.1-Flash on 32 NVIDIA L20A (GB200) GPUs. Kimi K3 results cover 8,
 
 [Full GB200 SE accuracy and performance data](docs/gb200_gc_moe_se.md).
 
+[Small-batch EP16/EP32 setup and optimization guide](docs/sm100_low_latency.md) · [Validated low-latency results](docs/gb200-low-latency-results-2026-11-27.md)
+
 ![Kimi K3 full-output decode latency and speedup for GC MoE K3, SGLang Mega MoE K3 and vLLM Mega MoE K3 on 8, 16 and 32 GB200 GPUs](docs/gb200_gc_moe_k3.png)
 
 [Full GB200 Kimi K3 accuracy and performance data](docs/gb200_gc_moe_k3.md).

@@ -7,6 +7,7 @@ All rates use each operator's original slowest-rank median. See JSON metadata.
 from __future__ import annotations
 import argparse
 import gc
+import inspect
 import json
 import os
 import sys
@@ -21,7 +22,6 @@ os.environ['DG_PRINT_CONFIGS'] = '0'
 import numpy as np
 import torch
 import torch.distributed as dist
-import deep_gemm
 import gc_moe
 assert Path(gc_moe.__file__).resolve().is_relative_to(_ROOT), gc_moe.__file__
 from test_gc_moe_se import (
@@ -121,6 +121,7 @@ def _bench_cuda_graph_ms(
     device: torch.device,
     barrier_fn: Optional[Callable[[], None]] = None,
     inter_iter_sleep_s: float = 0.005,
+    graph_event_timing: bool = False,
 ) -> Dict[str, float]:
     """Capture one call, time inner_iters replays, and divide the event time."""
     if inner_iters < 1:
@@ -135,9 +136,16 @@ def _bench_cuda_graph_ms(
     capture_stream = torch.cuda.Stream(device=device)
     capture_stream.wait_stream(torch.cuda.current_stream(device))
     g = torch.cuda.CUDAGraph()
+    if graph_event_timing:
+        graph_start = torch.cuda.Event(enable_timing=True, external=True)
+        graph_end = torch.cuda.Event(enable_timing=True, external=True)
     with torch.cuda.stream(capture_stream):
         with torch.cuda.graph(g, stream=capture_stream):
+            if graph_event_timing:
+                graph_start.record()
             fn()
+            if graph_event_timing:
+                graph_end.record()
     torch.cuda.current_stream(device).wait_stream(capture_stream)
     torch.cuda.synchronize(device)
 
@@ -158,6 +166,11 @@ def _bench_cuda_graph_ms(
         _flush_l2(device)
         torch.cuda.synchronize(device)
         time.sleep(inter_iter_sleep_s)
+        if graph_event_timing:
+            g.replay()
+            torch.cuda.synchronize(device)
+            times.append(graph_start.elapsed_time(graph_end))
+            continue
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -189,20 +202,33 @@ def main():
     p.add_argument('--num-topk', type=int, default=8)
     p.add_argument('--num-shared-experts', type=int, default=1)
     p.add_argument('--shared-weight-gran-k', type=int, choices=[32, 128], default=128)
+    p.add_argument('--omit-shared-recipe', action='store_true',
+                   help='Use the routed K32 recipe also for shared weights on legacy MegaMoE.')
     p.add_argument('--num-tokens-per-rank-list', default='')
     p.add_argument('--num-max-tokens-per-rank', type=int, default=0)
     p.add_argument('--activation', choices=['swiglu'], default='swiglu')
     p.add_argument('--activation-alpha', type=float, default=1.0)
     p.add_argument('--activation-clamp', type=float, default=10.0)
     p.add_argument('--fast-math', type=int, default=1)
+    p.add_argument('--gc-decode-mode', choices=['off', 'route', 'reduce', 'route-reduce', 'vector'], default='off')
+    p.add_argument('--gc-weight-reuse', choices=['off', 'alternate', 'w2', 'alternate-w2'], default='off')
+    p.add_argument('--gc-prefetch-experts', type=int, choices=range(5), default=0)
+    p.add_argument('--baseline-gc', action='store_true',
+                   help='Compare against stock GC with the same weights and layout.')
     p.add_argument('--warmup', type=int, default=10)
     p.add_argument('--iters', type=int, default=30)
     p.add_argument('--inner-iters', type=int, default=100)
+    p.add_argument('--graph-event-timing', action='store_true',
+                   help='Record CUDA Events inside each captured graph for single-replay timing.')
     p.add_argument('--cuda-graph-max-tokens-per-rank', type=int, default=256)
     p.add_argument('--output-json', default='results/_performance_results_gc_se.json')
     args = p.parse_args()
     assert args.num_shared_experts >= 1
+    if args.omit_shared_recipe and (args.baseline_gc or args.shared_weight_gran_k != 32):
+        p.error('--omit-shared-recipe requires the MegaMoE baseline and shared K32 weights')
     sweep = [int(t) for t in args.num_tokens_per_rank_list.split(',') if t.strip()] or DEFAULT_TOKENS_PER_RANK
+    if args.graph_event_timing and (args.inner_iters != 1 or max(sweep) > args.cuda_graph_max_tokens_per_rank):
+        p.error('--graph-event-timing requires one replay and CUDA Graph for every test case')
     capacity = args.num_max_tokens_per_rank or max(sweep)
     assert min(sweep) >= 1 and max(sweep) <= capacity
     device = torch.device('cuda', int(os.environ['LOCAL_RANK']))
@@ -213,6 +239,19 @@ def main():
     assert args.num_experts % world == 0, 'num_experts must be divisible by world_size'
     mr, gr, original_shared, ms, gs, recipe, original_routed = build_weights(
         args, rank, world, device, reference=True)
+    base_kind = 'gc' if args.baseline_gc else 'base'
+    if args.baseline_gc:
+        base_name, base_label = 'gc_moe.fp8_fp4_gc_moe', 'GC_stock_SE'
+        base_op, base_module = gc_moe.fp8_fp4_gc_moe, gc_moe.__file__
+    else:
+        import deep_gemm
+        base_name, base_label = 'deep_gemm.fp8_fp4_mega_moe', 'Mega_SE'
+        base_op, base_module = deep_gemm.fp8_fp4_mega_moe, deep_gemm.__file__
+    baseline_accepts_alpha = 'activation_alpha' in inspect.signature(base_op).parameters
+    if not baseline_accepts_alpha and args.activation_alpha != 1.0:
+        p.error('installed baseline only supports the default SwiGLU alpha of 1')
+    if args.baseline_gc:
+        mr, ms = gr, gs
     # Metadata only, outside timing; retain no additional quantized tensors.
     local_experts = args.num_experts // world
     routed_storage = _common_weight_storage(_weight_storage(mr, local_experts),
@@ -221,7 +260,7 @@ def main():
     shared_storage = _common_weight_storage(_weight_storage(ms), _weight_storage(gs),
                                             _weight_storage(original_shared))
     del original_shared, original_routed
-    mb = allocate_buffer(args, capacity, 'base')
+    mb = allocate_buffer(args, capacity, base_kind)
     gb = allocate_buffer(args, capacity, 'gc')
     torch.cuda.empty_cache()
     weight_storage_by_rank = _collect_weight_storage(routed_storage, shared_storage)
@@ -229,7 +268,7 @@ def main():
     for tokens in sweep:
         x, indices, weights = build_tokens(tokens, args.hidden, args.num_experts, args.num_topk, rank, device)
         x8, xs = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
-        msf, mbm = prepare_shared_sf(args, xs, mb, tokens, world, 'base')
+        msf, mbm = prepare_shared_sf(args, xs, mb, tokens, world, base_kind)
         gsf, gbm = prepare_shared_sf(args, xs, gb, tokens, world, 'gc')
         stage_inputs(mb, x8, xs, indices, weights, msf)
         stage_inputs(gb, x8, xs, indices, weights, gsf)
@@ -238,29 +277,37 @@ def main():
         common = dict(recipe=ROUTED_RECIPE, shared_recipe=recipe, activation=args.activation,
                       activation_clamp=args.activation_clamp, activation_alpha=args.activation_alpha,
                       fast_math=bool(args.fast_math))
+        baseline_options = common.copy()
+        if args.omit_shared_recipe:
+            baseline_options.pop('shared_recipe')
+        if not baseline_accepts_alpha:
+            baseline_options.pop('activation_alpha')
 
         def base_fn():
-            deep_gemm.fp8_fp4_mega_moe(base_y, *mr, mb,
-                shared_l1_weights=ms[0], shared_l2_weights=ms[1], **common)
+            base_op(base_y, *mr, mb,
+                shared_l1_weights=ms[0], shared_l2_weights=ms[1], **baseline_options)
 
         def candidate_fn():
             gc_moe.fp8_fp4_gc_moe(gc_y, *gr, gb,
-                shared_l1_weights=gs[0], shared_l2_weights=gs[1], **common)
+                shared_l1_weights=gs[0], shared_l2_weights=gs[1],
+                decode_mode=args.gc_decode_mode, weight_reuse=args.gc_weight_reuse,
+                prefetch_experts=args.gc_prefetch_experts, **common)
 
         graph_mode = args.cuda_graph_max_tokens_per_rank > 0 and tokens <= args.cuda_graph_max_tokens_per_rank
         bench = _bench_cuda_graph_ms if graph_mode else _bench_gpu_time_ms
+        timer_options = {'graph_event_timing': True} if args.graph_event_timing else {}
         order = [('baseline', base_fn), ('gc', candidate_fn)]
         if len(results) % 2:
             order.reverse()
         operator_stats = {}
         for name, fn in order:
             measured = bench(fn, warmup=args.warmup, iters=args.iters, inner_iters=args.inner_iters,
-                             device=device, barrier_fn=dist.barrier)
+                             device=device, barrier_fn=dist.barrier, **timer_options)
             measured.update(rank=rank, mode='cuda_graph' if graph_mode else 'eager')
             all_ranks = [None] * world
             dist.all_gather_object(all_ranks, measured)
             medians = [row['median_ms'] * 1000 for row in all_ranks]
-            operator_stats[name] = dict(operator='deep_gemm.fp8_fp4_mega_moe' if name == 'baseline'
+            operator_stats[name] = dict(operator=base_name if name == 'baseline'
                                        else 'gc_moe.fp8_fp4_gc_moe', ranks=all_ranks,
                                        per_rank_median_us=medians, slowest_rank_median_us=max(medians))
         workload = _collect_throughput_workload(
@@ -271,12 +318,19 @@ def main():
                       for name, measured in operator_stats.items()}
         base = operator_stats['baseline']['slowest_rank_median_us']
         candidate = operator_stats['gc']['slowest_rank_median_us']
+        comparison = [None] * world
+        dist.all_gather_object(comparison, {
+            'rank': rank,
+            'max_abs': (base_y.float() - gc_y.float()).abs().max().item(),
+            'bitwise_equal': torch.equal(base_y.view(torch.uint8), gc_y.view(torch.uint8)),
+        })
         results.append(dict(num_tokens_per_rank=tokens, num_tokens_global=tokens * world,
                             mode='cuda_graph' if graph_mode else 'eager', baseline_us=base, gc_us=candidate,
                             speedup=base / candidate, gc_block_m=gbm, mega_block_m=mbm,
-                            operator_stats=operator_stats, workload=workload, throughput=throughput))
+                            operator_stats=operator_stats, workload=workload, throughput=throughput,
+                            output_comparison=comparison))
         if rank == 0:
-            print(f'COMPARE tokens_per_rank={tokens} total_tokens={tokens * world} mode={results[-1]["mode"]} Mega_SE={base:.6f}us '
+            print(f'COMPARE tokens_per_rank={tokens} total_tokens={tokens * world} mode={results[-1]["mode"]} {base_label}={base:.6f}us '
                   f'CuTe_GC_SE={candidate:.6f}us speedup={base / candidate:.6f}', flush=True)
             _print_throughput_metrics(tokens, throughput)
         del base_y, gc_y, x, x8, xs, indices, weights, msf, gsf
@@ -294,8 +348,9 @@ def main():
                                       activation_gran_k=32, warmup=args.warmup,
                                       iters=args.iters, inner_iters=args.inner_iters,
                                       latency='maximum of per-rank medians over CUDA-event windows',
-                                      operators={'baseline': 'deep_gemm.fp8_fp4_mega_moe', 'candidate': 'gc_moe.fp8_fp4_gc_moe'},
-                                      modules={'baseline': deep_gemm.__file__, 'candidate': gc_moe.__file__},
+                                      operators={'baseline': base_name, 'candidate': 'gc_moe.fp8_fp4_gc_moe'},
+                                      modules={'baseline': base_module,
+                                               'candidate': gc_moe.__file__},
                                       throughput_metrics=_throughput_definitions(),
                                       weight_storage_by_rank=weight_storage_by_rank,
                                       results=results), indent=2) + '\n')

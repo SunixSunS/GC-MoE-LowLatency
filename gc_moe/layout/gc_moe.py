@@ -12,12 +12,15 @@ from dataclasses import dataclass
 CANDIDATE_BLOCK_M = (8, 16, 32, 64, 96, 128, 192, 240)
 TOKEN_ALIGNMENT = 1920
 MAX_RANKS = 72
+ROUTED_W2_PREFETCH_OFFSET = MAX_RANKS - 7
+ROUTED_W1_PREFETCH_OFFSET = MAX_RANKS - 6
+PACKED_ROUTED_SCALE_OFFSETS = (MAX_RANKS - 5, MAX_RANKS - 4)
 MAX_EXPERTS = 2048
 MAX_EXPERTS_PER_RANK = 512
 MAX_RING_BLOCKS = 1 << 20
 MAX_SHARED_L2_BLOCKS = 1 << 15
-# Accumulator barriers reserved here; the compute role indexes them by
-# tile.epilogue_stages, so the two depths must agree.
+# Default accumulator queue depth. Decode experiments reserve the matching
+# number of barriers and TMEM columns for their selected depth.
 ACCUM_BARRIER_STAGES = 2
 # Role 3 uses one dispatch warpgroup and two combine warpgroups.
 COMBINE_WARPS = 8
@@ -45,6 +48,7 @@ class SharedStorageLayout:
     tasks: int
     dispatch_bars: int
     data_full: int
+    weight_full: int
     data_empty: int
     accum_full: int
     accum_empty: int
@@ -60,7 +64,12 @@ def get_role_shared_layout(role: int, block_m: int, num_experts: int,
                            pull_bytes: int, stages: int, *,
                            store_m_l1: int, store_m_l2: int, dispatch_warps: int,
                            block_n: int, block_k: int,
-                           sf_block_m: int) -> SharedStorageLayout:
+                           sf_block_m: int, separate_weight_barrier: bool = False,
+                           parallel_activation_prefix: bool = False,
+                           double_buffer_dispatch_pull: bool = False,
+                           accumulator_stages: int = ACCUM_BARRIER_STAGES,
+                           local_mma: bool = False, task_slots: int = 2,
+                           paired_shared_weights: bool = False) -> SharedStorageLayout:
     """Lay out one role's shared data and control fields in byte order."""
     if role not in (1, 2, 3) or block_m % 16 or block_m < 16 or stages < 2:
         raise ValueError('invalid shared-storage role geometry')
@@ -79,7 +88,8 @@ def get_role_shared_layout(role: int, block_m: int, num_experts: int,
         cursor = 1
     else:
         reserve('expert_counts', num_experts * 4, 1024)
-        reserve('pull', dispatch_warps * pull_bytes, 1024)
+        pull_slots = 2 if double_buffer_dispatch_pull else 1
+        reserve('pull', dispatch_warps * pull_bytes * pull_slots, 1024)
     reserve('cd', max(2 * 2 * store_m_l1 * (block_n // 2),
                       2 * store_m_l2 * block_n * 2), 1024)
     if role == 1:
@@ -88,20 +98,24 @@ def get_role_shared_layout(role: int, block_m: int, num_experts: int,
         values['data_a'] = values['data_b'] = 0
         values['data_sfa'] = values['data_sfb'] = 0
     else:
-        reserve('data_a', stages * (block_m // 2) * block_k, 1024)
-        reserve('data_b', stages * block_n * block_k, 1024)
+        load_m = block_m if local_mma else block_m // 2
+        reserve('data_a', stages * load_m * block_k, 1024)
+        scale_bytes = stages * block_n * 4
+        reserve('data_b', stages * block_n * block_k + (scale_bytes if paired_shared_weights else 0), 1024)
         reserve('data_sfa', stages * sf_block_m * 4, 4)
-        reserve('data_sfb', stages * block_n * 4, 4)
+        reserve('data_sfb', 0 if paired_shared_weights else scale_bytes, 4)
     reserve('amax', 8 * store_m_l1 * 4, 8)
-    reserve('tasks', 2 * 32, 16)
-    reserve('dispatch_bars', dispatch_warps * 8, 8)
+    reserve('tasks', task_slots * 32, 16)
+    pull_bar_slots = 2 if parallel_activation_prefix or double_buffer_dispatch_pull else 1
+    reserve('dispatch_bars', dispatch_warps * pull_bar_slots * 8, 8)
     reserve('data_full', stages * 8, 8)
+    reserve('weight_full', stages * 8 if separate_weight_barrier else 0, 8)
     reserve('data_empty', stages * 8, 8)
-    reserve('accum_full', ACCUM_BARRIER_STAGES * 8, 8)
-    reserve('accum_empty', ACCUM_BARRIER_STAGES * 8, 8)
+    reserve('accum_full', accumulator_stages * 8, 8)
+    reserve('accum_empty', accumulator_stages * 8, 8)
     reserve('combine_bars', COMBINE_WARPS * 8, 8)
-    reserve('task_full', 2 * 8, 8)
-    reserve('task_empty', 2 * 8, 8)
+    reserve('task_full', task_slots * 8, 8)
+    reserve('task_empty', task_slots * 8, 8)
     reserve('tmem_ptr', 4, 4)
     return SharedStorageLayout(**values, reusable_bytes=values['dispatch_bars'],
                                field_end=cursor)
@@ -123,6 +137,8 @@ def _signal_offsets() -> dict[str, int]:
         ('recv_parity', 1, 4),
         ('role3_epoch', 1, 4),
         ('routed_pool_blocks', 1, 4),
+        ('routed_counts_ready', 1, 4),
+        ('compute_combine_epoch', 1, 4),
         ('combine_ready_grid_idx', MAX_RANKS, 8),
         ('expert_send_count', MAX_EXPERTS, 8),
         ('expert_recv_count', 2 * MAX_EXPERTS, 8),
@@ -169,6 +185,8 @@ class GCBufferLayout:
     ring_tokens: int
     sf_ring_tokens: int
     num_shared_experts: int = 0
+    packed_decode_activations: bool = False
+    packed_decode_scores: bool = False
 
     def __post_init__(self) -> None:
         ranks, experts, capacity = self.num_ranks, self.num_experts, self.capacity
@@ -181,6 +199,10 @@ class GCBufferLayout:
         if not (self.hidden > 0 and self.intermediate > 0 and
                 self.hidden % 128 == 0 and self.intermediate % 128 == 0):
             raise ValueError('hidden dimensions must be positive multiples of 128')
+        if self.packed_decode_activations and self.hidden != 6144:
+            raise ValueError('packed decode activations require hidden size 6144')
+        if self.packed_decode_scores and (not self.packed_decode_activations or self.topk != 8):
+            raise ValueError('packed decode scores require a packed top-8 input')
         if self.ring_tokens <= 0 or self.ring_tokens % TOKEN_ALIGNMENT != 0:
             raise ValueError('ring token capacity must be positive and 1920-aligned')
         required_sf_ring_tokens = max(
@@ -224,10 +246,26 @@ class GCBufferLayout:
             result[name] = BufferView(offset, nbytes, shape, dtype, stride)
             offset += nbytes
 
-        add('x', c * h, (c, h), 'float8_e4m3fn')
-        add('x_sf', c * h // 32, (c, h // 128), 'int32')
+        if self.packed_decode_activations:
+            scale_bytes = h // 32
+            score_bytes = self.topk * 4 if self.packed_decode_scores else 0
+            row_bytes = h + scale_bytes + score_bytes
+            last_row = (c - 1) * row_bytes
+            result['x'] = BufferView(offset, last_row + h, (c, h), 'float8_e4m3fn',
+                                     (row_bytes, 1))
+            result['x_sf'] = BufferView(offset + h, last_row + scale_bytes,
+                                        (c, h // 128), 'int32', (row_bytes // 4, 1))
+            if self.packed_decode_scores:
+                result['topk_weights'] = BufferView(
+                    offset + h + scale_bytes, last_row + score_bytes, (c, self.topk),
+                    'float32', (row_bytes // 4, 1))
+            offset += c * row_bytes
+        else:
+            add('x', c * h, (c, h), 'float8_e4m3fn')
+            add('x_sf', c * h // 32, (c, h // 128), 'int32')
         add('topk_idx', c * self.topk * 8, (c, self.topk), 'int64')
-        add('topk_weights', c * self.topk * 4, (c, self.topk), 'float32')
+        if not self.packed_decode_scores:
+            add('topk_weights', c * self.topk * 4, (c, self.topk), 'float32')
         result['shared_l1_acts'] = result['x']
         add('shared_l1_acts_sf', shared_sf * h // 32,
             (shared_sf, h // 128) if s else (0, h // 128), 'int32',

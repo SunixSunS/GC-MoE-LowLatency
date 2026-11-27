@@ -11,13 +11,14 @@ _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 import torch
 import torch.distributed as dist
-import deep_gemm
 import gc_moe
 assert Path(gc_moe.__file__).resolve().is_relative_to(_ROOT), gc_moe.__file__
 from typing import Optional, Tuple
 
-from deep_gemm.utils import align, per_block_cast_to_fp8, per_token_cast_to_fp4
-from deep_gemm.utils import per_token_cast_to_fp8
+from gc_moe.common.moe_quant import (
+    align, per_block_cast_to_fp8, per_token_cast_to_fp4, per_token_cast_to_fp8,
+    transform_sf_into_required_layout,
+)
 from test_gc_moe import build_tokens, cast_tokens_to_fp8
 
 
@@ -52,7 +53,7 @@ def cast_grouped_weights_to_fp4(
         quantized[group_idx], scales[group_idx] = per_token_cast_to_fp4(
             weights[group_idx], use_ue8m0=True, gran_k=ACTIVATION_GRAN_K
         )
-    scales = deep_gemm.transform_sf_into_required_layout(
+    scales = transform_sf_into_required_layout(
         scales, n, k, ROUTED_RECIPE[1:], groups
     )
     return quantized, scales
@@ -76,7 +77,7 @@ def cast_shared_weight_to_fp8(
         assert torch.equal(scales[::32].contiguous().view(torch.uint8),
                            block_scales.contiguous().view(torch.uint8))
         scale_recipe = (1, 32)
-    scales = deep_gemm.transform_sf_into_required_layout(
+    scales = transform_sf_into_required_layout(
         scales, n, k, scale_recipe, num_groups=None
     )
     return quantized, scales
@@ -241,17 +242,23 @@ def parse_per_rank_vectors(value):
     return [[int(t) for t in v.split(',') if t.strip()] for v in value.split(';') if v.strip()]
 
 
-def build_weights(args, rank, world, device, reference=False):
+def build_weights(args, rank, world, device, reference=False, with_mega=True):
     raw = build_local_weights(args.num_experts // world, args.intermediate_hidden, args.hidden, rank, device)
     quantized = tuple(cast_grouped_weights_to_fp4(w) for w in raw)
-    base_routed = deep_gemm.transform_weights_for_mega_moe(*quantized, activation=args.activation)
+    base_routed = None
+    if with_mega:
+        import deep_gemm
+        base_routed = deep_gemm.transform_weights_for_mega_moe(*quantized, activation=args.activation)
     gc_routed = gc_moe.transform_weights_for_gc_moe(*quantized, activation=args.activation)
     del raw
     raw = build_shared_weights(args.intermediate_hidden, args.hidden, args.num_shared_experts, device)
     recipe = (1, 128, 128) if args.shared_weight_gran_k == 128 else (1, 1, 32)
     weight_recipe = (1, args.shared_weight_gran_k, args.shared_weight_gran_k)
     shared = tuple(cast_shared_weight_to_fp8(w, weight_recipe) for w in raw)
-    base_shared = deep_gemm.transform_weights_for_mega_moe(*shared, activation=args.activation)
+    base_shared = None
+    if with_mega:
+        import deep_gemm
+        base_shared = deep_gemm.transform_weights_for_mega_moe(*shared, activation=args.activation)
     gc_shared = gc_moe.transform_weights_for_gc_moe(*shared, activation=args.activation)
     del raw
     result = base_routed, gc_routed, shared, base_shared, gc_shared, recipe
@@ -259,7 +266,11 @@ def build_weights(args, rank, world, device, reference=False):
 
 
 def allocate_buffer(args, capacity, operator, shared=True):
-    factory = gc_moe.get_symm_buffer_for_gc_moe if operator == 'gc' else deep_gemm.get_symm_buffer_for_mega_moe
+    if operator == 'gc':
+        factory = gc_moe.get_symm_buffer_for_gc_moe
+    else:
+        import deep_gemm
+        factory = deep_gemm.get_symm_buffer_for_mega_moe
     kwargs = dict(num_shared_experts=args.num_shared_experts if shared else 0,
                   mma_type='fp8xfp4', activation=args.activation)
     return factory(dist.group.WORLD, args.num_experts, capacity, args.num_topk,
@@ -267,8 +278,14 @@ def allocate_buffer(args, capacity, operator, shared=True):
 
 
 def prepare_shared_sf(args, x_sf, buffer, tokens, world, operator):
-    query = gc_moe.get_block_m_for_gc_moe if operator == 'gc' else deep_gemm.get_block_m_for_mega_moe
-    bm = query(world, args.num_experts, buffer.num_max_tokens_per_rank, tokens, args.num_topk, 'fp8xfp4')
+    if operator == 'gc':
+        query = gc_moe.get_block_m_for_gc_moe
+    else:
+        import deep_gemm
+        query = deep_gemm.get_block_m_for_mega_moe
+    bm = buffer.decode_block_m if operator == 'gc' else 0
+    if not bm:
+        bm = query(world, args.num_experts, buffer.num_max_tokens_per_rank, tokens, args.num_topk, 'fp8xfp4')
     return make_shared_input_sf(x_sf, torch.zeros_like(buffer.shared_l1_acts_sf), bm), bm
 
 def main():
@@ -288,6 +305,31 @@ def main():
     p.add_argument('--activation-alpha', type=float, default=1.0)
     p.add_argument('--activation-clamp', type=float, default=10.0)
     p.add_argument('--fast-math', type=int, default=1)
+    p.add_argument('--gc-decode-mode', choices=['off', 'route', 'reduce', 'route-reduce', 'vector'], default='off')
+    p.add_argument('--gc-weight-reuse', choices=['off', 'alternate', 'w2', 'alternate-w2'], default='off')
+    p.add_argument('--gc-prefetch-experts', type=int, choices=range(5), default=0)
+    p.add_argument('--gc-early-experts', type=int, choices=range(4))
+    p.add_argument('--gc-speculative-w1', action='store_true')
+    p.add_argument('--gc-release-group', type=int, choices=(1, 2, 4), default=1)
+    p.add_argument('--gc-direct-w1-store', action='store_true')
+    p.add_argument('--gc-narrow-bm32', action='store_true')
+    p.add_argument('--gc-single-mma-lane', action='store_true')
+    p.add_argument('--gc-ready-tile-order', action='store_true')
+    p.add_argument('--gc-programmatic-finalize', action='store_true')
+    p.add_argument('--gc-recycle-dispatch-sms', action='store_true')
+    p.add_argument('--gc-static-w1-prefix', action='store_true')
+    p.add_argument('--gc-direct-w2-store', action='store_true')
+    p.add_argument('--gc-compact-compute-ctas', type=int, choices=(0, 1, 2), default=0)
+    p.add_argument('--gc-dispatch-warps', type=int, choices=(0, 8, 12, 16, 24), default=0)
+    p.add_argument('--gc-early-stripe-combine', action='store_true')
+    p.add_argument('--gc-dedup-activations', action='store_true')
+    p.add_argument('--gc-source-activation-owner', action='store_true')
+    p.add_argument('--gc-weight-lookahead', type=int, choices=range(33), default=0)
+    p.add_argument('--gc-packed-route-counts', action='store_true')
+    p.add_argument('--gc-grouped-route-counts', action='store_true')
+    p.add_argument('--gc-pull-route-metadata', action='store_true')
+    p.add_argument('--baseline-gc', action='store_true',
+                   help='Check stock GC and the decode path against independent Torch math.')
     p.add_argument('--cosine-threshold', type=float, default=0.99,
                    help='Uniform minimum cosine for independent math, GC-to-Mega and omitted-vs-explicit recipe checks (0 to 1).')
     p.add_argument('--gc-replays', type=int, default=5)
@@ -310,9 +352,59 @@ def main():
     assert args.num_experts % world == 0, 'num_experts must be divisible by world_size'
     plan = vectors or [[t] * world for t in sweep]
     assert all(len(v) == world and min(v) >= 0 and max(v) <= capacity for v in plan)
+    new_decode = (args.gc_early_experts is not None or args.gc_release_group != 1 or
+                  args.gc_direct_w1_store or args.gc_narrow_bm32 or args.gc_single_mma_lane or
+                  args.gc_ready_tile_order or args.gc_programmatic_finalize or
+                  args.gc_recycle_dispatch_sms or args.gc_static_w1_prefix or
+                  args.gc_direct_w2_store or args.gc_speculative_w1 or
+                  args.gc_compact_compute_ctas or args.gc_dispatch_warps or
+                  args.gc_early_stripe_combine or args.gc_dedup_activations or
+                  args.gc_source_activation_owner or args.gc_weight_lookahead or
+                  args.gc_packed_route_counts or args.gc_grouped_route_counts or
+                  args.gc_pull_route_metadata)
+    if new_decode and (
+            not args.baseline_gc or any(max(v) > 32 for v in plan)):
+        p.error('experimental decode requires --baseline-gc and up to 32 tokens on every rank')
     mr, gr, original_shared, ms, gs, recipe, reference_routed = build_weights(args, rank, world, device, reference=True)
-    base_buffer = allocate_buffer(args, capacity, 'base')
-    gc_buffer = allocate_buffer(args, capacity, 'gc')
+    base_kind = 'gc' if args.baseline_gc else 'base'
+    base_name = 'gc_moe.fp8_fp4_gc_moe' if args.baseline_gc else 'deep_gemm.fp8_fp4_mega_moe'
+    base_op = gc_moe.fp8_fp4_gc_moe if args.baseline_gc else deep_gemm.fp8_fp4_mega_moe
+    base_tag = 'stock_gc' if args.baseline_gc else 'mega'
+    comparison_key = f'gc_{base_tag}'
+    independent_key = f'{base_tag}_independent'
+    shared_key = f'{base_tag}_shared'
+    if args.baseline_gc:
+        mr, ms = gr, gs
+    base_buffer = allocate_buffer(args, capacity, base_kind)
+    if not new_decode:
+        gc_buffer = allocate_buffer(args, capacity, 'gc')
+    else:
+        from gc_moe.gc import GCSymmBuffer
+
+        gc_buffer = GCSymmBuffer(dist.group.WORLD, args.num_experts, capacity,
+                                 args.num_topk, args.hidden, args.intermediate_hidden,
+                                 args.num_shared_experts, early_experts=args.gc_early_experts,
+                                 speculative_w1=args.gc_speculative_w1,
+                                 stage_alignment=args.gc_release_group,
+                                 release_group=args.gc_release_group,
+                                 direct_w1_store=args.gc_direct_w1_store,
+                                 narrow_bm32=args.gc_narrow_bm32,
+                                 single_mma_lane=args.gc_single_mma_lane,
+                                 ready_tile_order=args.gc_ready_tile_order,
+                                 programmatic_finalize=args.gc_programmatic_finalize,
+                                 recycle_dispatch_sms=args.gc_recycle_dispatch_sms,
+                                 static_w1_prefix=args.gc_static_w1_prefix,
+                                 direct_w2_store=args.gc_direct_w2_store,
+                                 compact_compute_ctas=args.gc_compact_compute_ctas,
+                                 decode_dispatch_warps=args.gc_dispatch_warps,
+                                 early_stripe_combine=args.gc_early_stripe_combine,
+                                 dedup_activations=args.gc_dedup_activations or
+                                 args.gc_source_activation_owner,
+                                 source_elects_activation_owner=args.gc_source_activation_owner,
+                                 weight_lookahead=args.gc_weight_lookahead,
+                                 packed_route_counts=args.gc_packed_route_counts,
+                                 packed_route_count_group=4 if args.gc_grouped_route_counts else 1,
+                                 pull_route_metadata=args.gc_pull_route_metadata)
     common = dict(recipe=ROUTED_RECIPE, activation=args.activation,
                   activation_clamp=args.activation_clamp, activation_alpha=args.activation_alpha,
                   fast_math=bool(args.fast_math))
@@ -323,7 +415,7 @@ def main():
         if args.all_routes_invalid:
             indices.fill_(-1)
         x8, xs = cast_tokens_to_fp8(x)
-        base_sf, base_bm = prepare_shared_sf(args, xs, base_buffer, tokens, world, 'base')
+        base_sf, base_bm = prepare_shared_sf(args, xs, base_buffer, tokens, world, base_kind)
         gc_sf, gc_bm = prepare_shared_sf(args, xs, gc_buffer, tokens, world, 'gc')
         stage_inputs(base_buffer, x8, xs, indices, routing_weights, base_sf)
         stage_inputs(gc_buffer, x8, xs, indices, routing_weights, gc_sf)
@@ -337,10 +429,16 @@ def main():
 
         def invoke(name, explicit=False):
             if name == 'base':
-                op, rw, sw, buffer, sf = deep_gemm.fp8_fp4_mega_moe, mr, ms, base_buffer, base_sf
+                op, rw, sw, buffer = base_op, mr, ms, base_buffer
             else:
-                op, rw, sw, buffer, sf = gc_moe.fp8_fp4_gc_moe, gr, gs, gc_buffer, gc_sf
+                op, rw, sw, buffer = gc_moe.fp8_fp4_gc_moe, gr, gs, gc_buffer
             kwargs = {} if args.omit_shared_recipe and not explicit else {'shared_recipe': recipe}
+            if name == 'gc' and args.gc_decode_mode != 'off':
+                kwargs['decode_mode'] = args.gc_decode_mode
+            if name == 'gc' and args.gc_weight_reuse != 'off':
+                kwargs['weight_reuse'] = args.gc_weight_reuse
+            if name == 'gc' and args.gc_prefetch_experts:
+                kwargs['prefetch_experts'] = args.gc_prefetch_experts
             op(outputs[name], *rw, buffer, shared_l1_weights=sw[0], shared_l2_weights=sw[1], **common, **kwargs)
 
         for name in outputs:
@@ -365,27 +463,31 @@ def main():
         metrics = []
         reference_finite = all(bool(torch.isfinite(t).all()) for t in [independent, routed, standalone])
         for base, candidate in zip(records['base'], records['gc']):
-            metrics.append(dict(
-                mega_independent=cosine(base, independent), gc_independent=cosine(candidate, independent),
-                mega_shared=cosine(base.float() - routed.float(), standalone),
-                gc_shared=cosine(candidate.float() - routed.float(), standalone),
-                gc_mega=cosine(candidate, base),
-                max_abs_gc_mega=float((candidate.float() - base.float()).abs().max()) if tokens else 0.0,
-                finite=reference_finite and bool(torch.isfinite(base).all()) and bool(torch.isfinite(candidate).all())))
-        local = {k: min(float(m[k]) for m in metrics) for k in
-                 ['mega_independent', 'gc_independent', 'mega_shared', 'gc_shared', 'gc_mega']}
+            metrics.append({
+                independent_key: cosine(base, independent), 'gc_independent': cosine(candidate, independent),
+                shared_key: cosine(base.float() - routed.float(), standalone),
+                'gc_shared': cosine(candidate.float() - routed.float(), standalone),
+                comparison_key: cosine(candidate, base),
+                f'max_abs_{comparison_key}': float((candidate.float() - base.float()).abs().max()) if tokens else 0.0,
+                'finite': reference_finite and bool(torch.isfinite(base).all()) and bool(torch.isfinite(candidate).all()),
+            })
+        metric_keys = (independent_key, 'gc_independent', shared_key, 'gc_shared', comparison_key)
+        local = {k: min(float(m[k]) for m in metrics) for k in metric_keys}
+        abs_key = f'max_abs_{comparison_key}'
+        local[abs_key] = max(m[abs_key] for m in metrics)
         local.update(rank=rank, num_tokens_per_rank=tokens, gc_block_m=gc_bm, base_block_m=base_bm,
                      finite=all(m['finite'] for m in metrics), checked_outputs_per_operator=len(metrics),
-                     max_abs_gc_mega=max(m['max_abs_gc_mega'] for m in metrics), repeat_checks=metrics)
+                     repeat_checks=metrics)
         if args.omit_shared_recipe:
             local['default_explicit_cos'] = {}
             for name in outputs:
                 previous = outputs[name].clone()
                 invoke(name, explicit=True)
                 local['default_explicit_cos'][name] = cosine(previous, outputs[name])
-        local['passed'] = (local['finite'] and local['gc_mega'] >= args.cosine_threshold
-                           and min(local[k] for k in ['mega_independent', 'gc_independent', 'mega_shared', 'gc_shared']) >= args.cosine_threshold
+        local['passed'] = (local['finite'] and min(local[k] for k in metric_keys) >= args.cosine_threshold
                            and min(local.get('default_explicit_cos', {'unused': 1}).values()) >= args.cosine_threshold)
+        if new_decode:
+            local['passed'] &= local[abs_key] == 0
         rank_checks = [None] * world
         dist.all_gather_object(rank_checks, local)
         passed = all(row['passed'] for row in rank_checks)
@@ -395,9 +497,9 @@ def main():
         results.append(case)
         if rank == 0:
             print(f"CASE {case['case']} tokens_per_rank={case['num_tokens_per_rank']} "
-                  f"total_tokens={case['num_tokens_global']} vector={vector} gc_mega={min(r['gc_mega'] for r in rank_checks):.9f} "
-                  f"independent={min(min(r['mega_independent'],r['gc_independent']) for r in rank_checks):.9f} "
-                  f"shared={min(min(r['mega_shared'],r['gc_shared']) for r in rank_checks):.9f} "
+                  f"total_tokens={case['num_tokens_global']} vector={vector} {comparison_key}={min(r[comparison_key] for r in rank_checks):.9f} "
+                  f"independent={min(min(r[independent_key],r['gc_independent']) for r in rank_checks):.9f} "
+                  f"shared={min(min(r[shared_key],r['gc_shared']) for r in rank_checks):.9f} "
                   f"finite={all(r['finite'] for r in rank_checks)} {'PASS' if passed else 'FAIL'}", flush=True)
         del graphs, graph, records, outputs, metrics, x, x8, xs, indices, routing_weights
         torch.cuda.synchronize(device)
@@ -415,8 +517,9 @@ def main():
                          activation_gran_k=ACTIVATION_GRAN_K,
                          eager_repeats=args.gc_replays, graph_repeats=args.gc_replays,
                          reference='external Torch dequant, distributed routed sum and local shared branch; no MoE reference calls',
-                         operators={'baseline': 'deep_gemm.fp8_fp4_mega_moe', 'candidate': 'gc_moe.fp8_fp4_gc_moe'},
-                         modules={'baseline': deep_gemm.__file__, 'candidate': gc_moe.__file__},
+                         operators={'baseline': base_name, 'candidate': 'gc_moe.fp8_fp4_gc_moe'},
+                         modules={'baseline': gc_moe.__file__ if args.baseline_gc else deep_gemm.__file__,
+                                  'candidate': gc_moe.__file__},
                          all_pass=all_pass, results=results), indent=2) + '\n')
         print('ALL PASS' if all_pass else 'SOME FAILED', str(out), flush=True)
     torch.cuda.synchronize(device)

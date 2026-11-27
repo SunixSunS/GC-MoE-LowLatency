@@ -47,7 +47,10 @@ def _check_weight(w: torch.Tensor, expected: tuple[int, ...], dtype: torch.dtype
     if tuple(w.shape) != expected:
         raise ValueError(f'{name} needs K128 packed shape {expected}; call transform_weights_for_gc_moe first')
     if not w.is_contiguous():
-        raise ValueError(f'{name} packed storage must be contiguous')
+        from ..jit_kernels.impls.runtime_utils import is_routed_weight_tile_layout
+
+        if not is_routed_weight_tile_layout(w):
+            raise ValueError(f'{name} packed storage must have contiguous rows')
     if w.data_ptr() % 16:
         raise ValueError(f"{name} must be 16-byte aligned for TMA")
     if any(w.stride(axis) * w.element_size() % 16 for axis in range(w.ndim - 1)):
@@ -100,10 +103,29 @@ def validate_call(y: torch.Tensor, l1_weights: tuple[torch.Tensor, torch.Tensor]
     if sym_buffer.num_experts % ranks:
         raise ValueError('expert count must divide rank count')
     local_e = sym_buffer.num_experts // ranks
-    _check_weight(l1_weights[0], (local_e,h//128,2*i,64), torch.int8, 'routed W1')
-    _check_weight(l2_weights[0], (local_e,i//128,h,64), torch.int8, 'routed W2')
-    _check_sf(l1_weights[1], (local_e,2*i,h//128), 'routed W1 SF')
-    _check_sf(l2_weights[1], (local_e,h,i//128), 'routed W2 SF')
+    grouped_weights = getattr(sym_buffer, 'grouped_routed_weights', 0)
+    packed_scale_base = getattr(sym_buffer, 'packed_routed_scale_base', None)
+    packed_scale_k_group = getattr(sym_buffer, 'packed_routed_scale_k_group', 1)
+    for phase, pair, n, k in ((0, l1_weights, 2 * i, h), (1, l2_weights, h, i)):
+        shape = (local_e, k // 128, n, 64)
+        if grouped_weights & (1 << phase):
+            inner_k = pair[0].shape[3] if pair[0].ndim == 6 else 0
+            if n % 128 or inner_k not in (2, 4, 8, 16) or k % (128 * inner_k):
+                raise ValueError('grouped routed weights require N128 and whole K groups')
+            shape = (local_e, k // (128 * inner_k), n // 128, inner_k, 128, 64)
+        _check_weight(pair[0], shape, torch.int8, f'routed W{phase + 1}')
+        scale = pair[1]
+        if packed_scale_base is None:
+            _check_sf(scale, (local_e, n, k // 128), f'routed W{phase + 1} SF')
+        else:
+            packed_shape = (local_e, k // 128, n // 128, 32)
+            if packed_scale_k_group == 4:
+                if k % 512:
+                    raise ValueError('grouped scales require complete K512 packets')
+                packed_shape = (local_e, n // 128, k // 512, 32, 4)
+            if (scale.dtype != torch.int32 or tuple(scale.shape) != packed_shape or
+                    not scale.is_cuda or not scale.is_contiguous() or scale.data_ptr() % 16):
+                raise ValueError(f'routed W{phase + 1} compressed scales need contiguous int32 {packed_shape}')
     shared_experts = 0
     if shared_l1_weights is not None:
         if shared_l2_weights[0].ndim != 3:
@@ -123,14 +145,18 @@ def validate_call(y: torch.Tensor, l1_weights: tuple[torch.Tensor, torch.Tensor]
         if stats.dtype != torch.int32 or stats.numel() != local_e or \
                 not stats.is_cuda or not stats.is_contiguous():
             raise ValueError('stats must be contiguous CUDA int32 [local_experts]')
-    bm = get_block_m_for_gc_moe(ranks, sym_buffer.num_experts,
-                                sym_buffer.num_max_tokens_per_rank, tokens,
-                                sym_buffer.num_topk)
+    bm = sym_buffer.decode_block_m
+    if bm and tokens > 32:
+        raise ValueError('decode block M override requires at most 32 tokens per rank')
+    if not bm:
+        bm = get_block_m_for_gc_moe(ranks, sym_buffer.num_experts,
+                                   sym_buffer.num_max_tokens_per_rank, tokens,
+                                   sym_buffer.num_topk)
     call_layout = GCBufferLayout(
         ranks, sym_buffer.num_experts, sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk, h, i,
         sym_buffer.layout.ring_tokens, sym_buffer.layout.sf_ring_tokens,
-        shared_experts)
+        shared_experts, sym_buffer.packed_decode_activations, sym_buffer.packed_decode_scores)
     if call_layout.nbytes > sym_buffer.buffer.nbytes:
         raise ValueError("symmetric buffer is too small for call's shared experts")
     return ValidatedCall(tokens, bm, h, i, local_e, shared_experts,
@@ -148,7 +174,15 @@ def fp8_fp4_gc_moe(y: torch.Tensor,
                     activation: str = 'swiglu', activation_clamp: Optional[float] = None,
                     fast_math: bool = True,
                     shared_recipe: Optional[tuple[int, int, int]] = None,
-                    activation_alpha: Optional[float] = None) -> None:
+                    activation_alpha: Optional[float] = None, *,
+                    decode_mode: str = 'off', weight_reuse: str = 'off',
+                    prefetch_experts: int = 0) -> None:
+    if decode_mode not in ('off', 'route', 'reduce', 'route-reduce', 'vector'):
+        raise ValueError(f'unsupported GC MoE decode mode: {decode_mode!r}')
+    if weight_reuse not in ('off', 'alternate', 'w2', 'alternate-w2'):
+        raise ValueError(f'unsupported GC MoE weight-reuse mode: {weight_reuse!r}')
+    if type(prefetch_experts) is not int or not 0 <= prefetch_experts <= 4:
+        raise ValueError('GC MoE prefetch_experts must be an integer from 0 to 4')
     config = validate_call(y, l1_weights, l2_weights, sym_buffer,
                            shared_l1_weights, shared_l2_weights,
                            cumulative_local_expert_recv_stats, recipe, activation,
@@ -158,4 +192,5 @@ def fp8_fp4_gc_moe(y: torch.Tensor,
     from ..jit_kernels.impls.sm100_fp8_fp4_gc_moe import launch_gc_moe
     launch_gc_moe(config, y, l1_weights, l2_weights, call_buffer,
                   shared_l1_weights, shared_l2_weights,
-                  cumulative_local_expert_recv_stats)
+                  cumulative_local_expert_recv_stats, decode_mode=decode_mode,
+                  weight_reuse=weight_reuse, prefetch_experts=prefetch_experts)
