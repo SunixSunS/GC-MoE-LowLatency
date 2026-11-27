@@ -24,6 +24,15 @@ _WAIT_TIMEOUT_CYCLES = 60 * 2_000_000_000
 
 
 @cute.jit
+def wait_route_count_doorbell(ptr: cute.Pointer, epoch: Uint32, lane: Uint32) -> None:
+    """Wait on the local epoch before issuing the per-expert acquire loads."""
+    if lane == Uint32(0):
+        while ld_acquire_gpu_u32(ptr) != epoch:
+            pass
+    cute.arch.sync_warp()
+
+
+@cute.jit
 def sync_dispatch_threads(participants: cutlass.Constexpr = 0) -> None:
     """Dispatch barrier id 0; zero preserves the existing whole-CTA scope.
 

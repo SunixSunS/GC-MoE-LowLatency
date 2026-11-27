@@ -54,6 +54,7 @@ if __name__ == '__main__':
             include=['gc_moe', 'gc_moe.*'],
             exclude=['*.__pycache__', '*.__pycache__.*'],
         ),
+        package_data={'gc_moe.jit_kernels.impls': ['sm100_decode_dispatch.cu']},
         python_requires='>=3.10',
         install_requires=[
             'torch>=2.11.0,<2.12',

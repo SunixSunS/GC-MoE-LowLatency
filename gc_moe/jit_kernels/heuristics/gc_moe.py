@@ -8,6 +8,7 @@ from math import ceil, sqrt
 from struct import pack, unpack
 
 from ...layout.gc_moe import (
+    ACCUM_BARRIER_STAGES,
     CANDIDATE_BLOCK_M,
     COMBINE_WARPS,
     FINALIZE_THREADS,
@@ -129,64 +130,112 @@ class RoleConfig:
 
 @lru_cache(maxsize=256)
 def get_role_config(role: int, block_m: int, num_experts: int,
-                    hidden: int, *, local_experts: int) -> RoleConfig:
-    if role not in (1, 2, 3) or block_m not in CANDIDATE_BLOCK_M or block_m % 16:
+                    hidden: int, *, local_experts: int, stage_alignment: int = 1,
+                    compact_compute: bool = False, decode_dispatch_warps: int = 0,
+                    separate_weight_barrier: bool = False,
+                    packed_decode_activations: bool = False,
+                    packed_decode_scores: bool = False,
+                    decode_tma_stages: int = 0, parallel_activation_prefix: bool = False,
+                    double_buffer_dispatch_pull: bool = False,
+                    single_epilogue_warpgroup: bool = False,
+                    accumulator_stages: int = ACCUM_BARRIER_STAGES,
+                    local_mma: bool = False, task_slots: int = 2,
+                    paired_shared_weights: bool = False) -> RoleConfig:
+    if role not in (1, 2, 3) or block_m not in (*CANDIDATE_BLOCK_M, 48) or block_m % 16:
         raise ValueError('invalid GC role/block M')
-    pull_bytes = hidden
+    if single_epilogue_warpgroup and (role != 2 or block_m > 64):
+        raise ValueError('one epilogue warpgroup requires small compute tiles')
+    if accumulator_stages != ACCUM_BARRIER_STAGES and (role != 2 or block_m > 64):
+        raise ValueError('alternate accumulator queues require small compute tiles')
+    pull_bytes = hidden + hidden // 32 if packed_decode_activations else hidden
+    if packed_decode_scores:
+        pull_bytes += 8 * 4
     while pull_bytes > 8192:
         if pull_bytes % 2:
             raise ValueError('raw-address pull must divide hidden bytes')
         pull_bytes //= 2
     store1 = 8 if block_m <= 16 else 16 if block_m <= 96 else 32 if block_m <= 192 else 24
+    if block_m == 48 and not single_epilogue_warpgroup:
+        # Two epilogue warpgroups each own 24 rows.
+        store1 = 8
     store2 = 8 if block_m == 240 else store1
     # Large local expert tables need 96 registers per dispatch thread.
     # Keep that path within the per-SM register budget.
     routing_warps = (24 if local_experts <= 64 else 12) if block_m >= 96 else 8
+    if decode_dispatch_warps:
+        if role != 1 or block_m > 64 or local_experts > 64:
+            raise ValueError('custom Dispatch warps require small decode tiles')
+        routing_warps = decode_dispatch_warps
     dispatch_threads = routing_warps * 32 if role == 1 else 128
     dispatch_warps = dispatch_threads // 32
     smem_cd = align(max(2 * store1 * 64 * 2, 2 * store2 * 128 * 2), 1024)
     smem_amax = store1 * 8 * 4
-    stage = block_m // 2 * 128 + 128 * 128 + align(block_m, 128) * 4 + 128 * 4 + 16
+    load_m = block_m if local_mma else block_m // 2
+    stage = load_m * 128 + 128 * 128 + align(block_m, 128) * 4 + 128 * 4 + 16
+    if separate_weight_barrier:
+        stage += 8
     # get_gc_moe_config budgets dispatch/finalize SMEM with the base four
     # dispatch warps. Its JIT separately widens role1 and fixes its stages=2.
     budget_dispatch = (1024 if role == 2 else
                        align(num_experts * 4, 1024) + align(4 * pull_bytes, 1024))
-    budget_barriers = (4 + 4 + COMBINE_WARPS + 4) * 8
-    budget_fixed = budget_dispatch + smem_cd + smem_amax + budget_barriers + 2 * 32 + 4
+    budget_barriers = (4 + 2 * accumulator_stages + COMBINE_WARPS + 2 * task_slots) * 8
+    budget_fixed = budget_dispatch + smem_cd + smem_amax + budget_barriers + task_slots * 32 + 4
     budget_stages = (SMEM_CAPACITY - budget_fixed) // stage
     if budget_stages < 2:
         raise ValueError('insufficient shared memory for two TMA stages')
     dynamic_smem = budget_fixed + budget_stages * stage
     stages = 2 if role == 1 else budget_stages
+    if compact_compute:
+        if role != 2 or block_m > 64:
+            raise ValueError('compact storage is supported only by small compute tiles')
+        stages = min(stages, 4 if block_m == 64 else 5)
+    if decode_tma_stages:
+        # Keep the launch's SMEM reservation to isolate pipeline depth
+        # from changes in per-SM worker occupancy.
+        stages = min(stages, decode_tma_stages)
+    stages -= stages % stage_alignment
+    if stages < 2:
+        raise ValueError('insufficient shared memory for aligned TMA stages')
     # Actual SharedStorage uses the widened role1 pull region. Keep its byte
     # count distinct from the launch allocation retained by the reference.
     actual_dispatch = (1024 if role == 2 else align(num_experts * 4, 1024) +
                        align(dispatch_warps * pull_bytes, 1024))
-    actual_barriers = (dispatch_warps + 4 + COMBINE_WARPS + 4) * 8
-    fixed = actual_dispatch + smem_cd + smem_amax + actual_barriers + 2 * 32 + 4
+    actual_barriers = (dispatch_warps * (2 if parallel_activation_prefix else 1) +
+                       2 * accumulator_stages + COMBINE_WARPS + 2 * task_slots) * 8
+    fixed = actual_dispatch + smem_cd + smem_amax + actual_barriers + task_slots * 32 + 4
     if role != 1 and fixed + stages * stage > dynamic_smem:
         raise ValueError('role shared-storage footprint exceeds launch allocation')
-    threads = (dispatch_threads if role == 1 else
-               FINALIZE_THREADS if role == 3 else 384)
+    threads = (dispatch_threads if role == 1 else FINALIZE_THREADS if role == 3 else
+               256 if single_epilogue_warpgroup else 384)
     shared_layout = get_role_shared_layout(
         role, block_m, num_experts, pull_bytes, stages,
         store_m_l1=store1, store_m_l2=store2, dispatch_warps=dispatch_warps,
-        block_n=BLOCK_N, block_k=BLOCK_K, sf_block_m=align(block_m, 128))
+        block_n=BLOCK_N, block_k=BLOCK_K, sf_block_m=align(block_m, 128),
+        separate_weight_barrier=separate_weight_barrier,
+        parallel_activation_prefix=parallel_activation_prefix,
+        double_buffer_dispatch_pull=double_buffer_dispatch_pull,
+        accumulator_stages=accumulator_stages, local_mma=local_mma, task_slots=task_slots,
+        paired_shared_weights=paired_shared_weights)
     if role == 1:
         # The dispatch layout has no MMA planes; use its actual footprint.
         dynamic_smem = shared_layout.field_end
         if dynamic_smem > SMEM_CAPACITY:
             raise ValueError('role1 pull region exceeds shared memory')
+    if compact_compute:
+        dynamic_smem = shared_layout.field_end
+        if dynamic_smem > SMEM_CAPACITY // 2 - 1024:
+            raise ValueError('compact compute tiles exceed the two-CTA shared-memory budget')
     if shared_layout.field_end > dynamic_smem:
         raise ValueError('role shared storage exceeds its launch allocation')
     return RoleConfig(role, block_m, BLOCK_N, BLOCK_K, store1, store2,
                       dispatch_threads, threads, stages, dynamic_smem,
-                      stage, fixed, block_m // 2, align(block_m, 128),
+                      stage, fixed, load_m, align(block_m, 128),
                       128, 128, 64, routing_warps, pull_bytes, shared_layout)
 
 
 def get_combine_geometry(hidden: int, slots: int, reusable_bytes: int,
-                         launch_bytes: int) -> tuple[int, int, int]:
+                         launch_bytes: int, *,
+                         max_fetch_bytes: int | None = None) -> tuple[int, int, int]:
     """Reusable-prefix and per-warp combine scratch geometry.
 
     A chunk fetches every routed slot at once, so the scratch holds `slots`
@@ -204,7 +253,8 @@ def get_combine_geometry(hidden: int, slots: int, reusable_bytes: int,
         chunk_bytes = 2 * hidden // chunks
         if chunk_bytes % 512 == 0:
             scratch_bytes = slots * COMBINE_WARPS * chunk_bytes
-            if scratch_bytes <= reusable_bytes:
+            if (scratch_bytes <= reusable_bytes and
+                    (max_fetch_bytes is None or slots * chunk_bytes <= max_fetch_bytes)):
                 break
     else:
         raise ValueError('role3 combine scratch exceeds reusable shared memory')
